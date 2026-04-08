@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import SmartRouterAction, SmartRouterObservation
     from .smart_router_environment import SmartRouterEnvironment
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     from models import SmartRouterAction, SmartRouterObservation
     from server.smart_router_environment import SmartRouterEnvironment
 
