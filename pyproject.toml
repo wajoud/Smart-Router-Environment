@@ -18,6 +18,12 @@ dependencies = [
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
     "openenv-core[core]>=0.2.2",
+    # LLM backends for judge/curriculum
+    "openai>=1.0.0",
+    "anthropic>=0.39.0",
+    "huggingface_hub>=0.20.0",
+    # Visualization
+    "matplotlib>=3.7.0",
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
     # Examples:
@@ -29,9 +35,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+train = [
+    "trl[vllm]==0.29.0",
+    "vllm==0.11.2",
+    "torch>=2.8.0,<2.10.0",
+    "peft",
+    "transformers",
+    "datasets",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
+]
+eval = [
+    "vllm==0.11.2",
+    "transformers",
+    "tabulate>=0.9.0",
 ]
 
 [project.scripts]

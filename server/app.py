@@ -28,26 +28,21 @@ Usage:
     python -m server.app
 """
 
-# try:
-#     from openenv.core.env_server.http_server import create_app
-# except Exception as e:  # pragma: no cover
-#     raise ImportError(
-#         "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
-#     ) from e
+try:
+    from openenv.core.env_server.http_server import create_app
+except Exception as e:  # pragma: no cover
+    raise ImportError(
+        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
+    ) from e
 
-# try:
-#     from ..models import SmartRouterAction, SmartRouterObservation
-#     from .smart_router_environment import SmartRouterEnvironment
-# except ModuleNotFoundError:
-#     from models import SmartRouterAction, SmartRouterObservation
-#     from server.smart_router_environment import SmartRouterEnvironment
+try:
+    from ..models import SmartRouterAction, SmartRouterObservation
+    from .smart_router_environment import SmartRouterEnvironment
+except ModuleNotFoundError:
+    from models import SmartRouterAction, SmartRouterObservation
+    from server.smart_router_environment import SmartRouterEnvironment
 
 import os
-from openenv.core.env_server.http_server import create_app
-from openenv.core.env_server import create_fastapi_app
-from .smart_router_environment import SmartRouterEnvironment
-from models import SmartRouterAction, SmartRouterObservation
-
 
 os.environ["ENABLE_WEB_INTERFACE"] = "true"
 
@@ -92,4 +87,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    main(port=args.port)
+    main()
