@@ -29,17 +29,17 @@ class SmartRouterEnv(
         >>> # Connect to a running server
         >>> with SmartRouterEnv(base_url="http://localhost:8000") as client:
         ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     print(f"Latency: {result.observation.latency_ms}ms")
         ...
-        ...     result = client.step(SmartRouterAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     result = client.step(SmartRouterAction(path_selection=0))
+        ...     print(f"Reward: {result.reward}")
 
     Example with Docker:
         >>> # Automatically start container and connect
         >>> client = SmartRouterEnv.from_docker_image("smart_router-env:latest")
         >>> try:
         ...     result = client.reset()
-        ...     result = client.step(SmartRouterAction(message="Test"))
+        ...     result = client.step(SmartRouterAction(path_selection=0))
         ... finally:
         ...     client.close()
     """
@@ -55,7 +55,7 @@ class SmartRouterEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
-            "message": action.message,
+            "path_selection": action.path_selection,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[SmartRouterObservation]:
@@ -70,8 +70,9 @@ class SmartRouterEnv(
         """
         obs_data = payload.get("observation", {})
         observation = SmartRouterObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+            latency_ms=obs_data.get("latency_ms", 0.0),
+            packet_loss=obs_data.get("packet_loss", 0.0),
+            is_congested=obs_data.get("is_congested", False),
             done=payload.get("done", False),
             reward=payload.get("reward"),
             metadata=obs_data.get("metadata", {}),

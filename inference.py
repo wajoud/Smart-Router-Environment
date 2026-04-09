@@ -49,7 +49,6 @@ import textwrap
 from typing import List, Optional
 
 from openai import OpenAI
-
 from smart_router import SmartRouterAction, SmartRouterEnv
 
 # Configuration - following MANDATORY requirements
@@ -138,7 +137,7 @@ def build_user_prompt(
         Status: {status}
         Latency: {latency:.1f}ms | Packet Loss: {packet_loss:.2f} | Congested: {is_congested}
 
-        Last Action: {last_action if last_action is not None else 'None'}
+        Last Action: {last_action if last_action is not None else "None"}
         Last Reward: {last_reward:.2f}
 
         Recent History:
@@ -245,7 +244,9 @@ async def main() -> None:
             path_names = {0: "Fiber", 1: "Copper", 2: "Satellite"}
             action_str = f"{action_id}({path_names.get(action_id, '?')})"
 
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+            log_step(
+                step=step, action=action_str, reward=reward, done=done, error=error
+            )
 
             # Update history for next prompt
             history.append(
