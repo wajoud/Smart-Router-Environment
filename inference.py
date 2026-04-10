@@ -59,7 +59,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 TASK_NAME = os.getenv("SMART_ROUTER_TASK", "routing")
 BENCHMARK = os.getenv("SMART_ROUTER_BENCHMARK", "smart_router")
-MAX_STEPS = 100
+MAX_STEPS = 15
 TEMPERATURE = 0.7
 MAX_TOKENS = 50
 SUCCESS_SCORE_THRESHOLD = 0.5  # normalized score in [0, 1]
