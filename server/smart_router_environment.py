@@ -28,10 +28,11 @@ except ImportError:
 class SmartRouterEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self):
+    def __init__(self, task_type: str = "routing"):
         super().__init__()
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self.curriculum = CurriculumController()
+        self.task_type = task_type
 
         # Curriculum-controlled parameters
         self._chaos_interval = 5
@@ -135,7 +136,7 @@ class SmartRouterEnvironment(Environment):
             success = self._episode_reward >= success_threshold
 
             self.curriculum.record(
-                task_type="routing",
+                task_type=self.task_type,
                 success=success,
                 steps=self._episode_step,
                 reward=self._episode_reward

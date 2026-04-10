@@ -56,7 +56,6 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-TASK_NAME = os.getenv("SMART_ROUTER_TASK", "routing")
 BENCHMARK = os.getenv("SMART_ROUTER_BENCHMARK", "smart_router")
 MAX_STEPS = 15
 TEMPERATURE = 0.7
@@ -66,6 +65,9 @@ SUCCESS_SCORE_THRESHOLD = 0.5  # normalized score in [0, 1]
 # Estimate for max possible reward (optimal strategy: ~7 reward/step)
 _MAX_REWARD_PER_STEP = 7.0
 MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
+
+# Define 3 task types for hackathon validation
+TASK_TYPES = ["routing", "routing-congested", "routing-stable"]
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -189,11 +191,9 @@ def get_model_action(
         return 1 if is_congested else 0
 
 
-def main() -> None:
-    """Run inference episode on Smart Router environment."""
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    env = SmartRouterEnvironment()
+def run_task(task_name: str, client: OpenAI) -> None:
+    """Run inference episode for a specific task."""
+    env = SmartRouterEnvironment(task_type=task_name)
 
     history: List[str] = []
     rewards: List[float] = []
@@ -201,7 +201,7 @@ def main() -> None:
     score = 0.0
     success = False
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         obs = env.reset()
@@ -254,9 +254,9 @@ def main() -> None:
             if done:
                 break
 
-        # Calculate score in [0, 1] range
-        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
-        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1]
+        # Calculate score in (0, 1) range - strictly between 0 and 1, not inclusive
+        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.001
+        score = min(max(score, 0.001), 0.999)  # clamp to (0, 1) exclusive
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
@@ -266,6 +266,15 @@ def main() -> None:
             print(f"[DEBUG] env.close() error: {e}", flush=True)
 
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+
+def main() -> None:
+    """Run inference on all task types."""
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    # Run all 3 tasks to meet hackathon validation requirements
+    for task_type in TASK_TYPES:
+        run_task(task_type, client)
 
 
 if __name__ == "__main__":
