@@ -7,13 +7,13 @@ MANDATORY REQUIREMENTS:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     HF_TOKEN       Your Hugging Face / API key.
-    LOCAL_IMAGE_NAME The name of the local image to use for the environment if you are using from_docker_image()
-                     method
 
 - Defaults are set only for API_BASE_URL and MODEL_NAME
     (and should reflect your active inference setup):
     API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
     MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+
+- The environment runs entirely in-process - no server or Docker required
 
 - The inference script must be named `inference.py` and placed in the root directory of the project
 - Participants must use OpenAI Client for all LLM calls using above variables
@@ -43,16 +43,15 @@ STDOUT FORMAT
     [END] success=true steps=3 score=0.847 rewards=8.59,8.09,1.67
 """
 
-import asyncio
 import os
 import textwrap
 from typing import List, Optional
 
 from openai import OpenAI
-from smart_router import SmartRouterAction, SmartRouterEnv
+from smart_router import SmartRouterAction, SmartRouterObservation
+from server.smart_router_environment import SmartRouterEnvironment
 
 # Configuration - following MANDATORY requirements
-IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -190,11 +189,11 @@ def get_model_action(
         return 1 if is_congested else 0
 
 
-async def main() -> None:
+def main() -> None:
     """Run inference episode on Smart Router environment."""
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    env = await SmartRouterEnv.from_docker_image(IMAGE_NAME)
+    env = SmartRouterEnvironment()
 
     history: List[str] = []
     rewards: List[float] = []
@@ -205,14 +204,14 @@ async def main() -> None:
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = await env.reset()
-        obs = result.observation
+        obs = env.reset()
 
         last_action: Optional[int] = None
         last_reward = 0.0
+        done = False
 
         for step in range(1, MAX_STEPS + 1):
-            if result.done:
+            if done:
                 break
 
             # Get action from model
@@ -228,9 +227,8 @@ async def main() -> None:
             )
 
             # Execute action
-            result = await env.step(SmartRouterAction(path_selection=action_id))
+            result = env.step(SmartRouterAction(path_selection=action_id))
             obs = result.observation
-
             reward = result.reward or 0.0
             done = result.done
             error = None
@@ -263,12 +261,12 @@ async def main() -> None:
 
     finally:
         try:
-            await env.close()
+            env.close()
         except Exception as e:
-            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
+            print(f"[DEBUG] env.close() error: {e}", flush=True)
 
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
