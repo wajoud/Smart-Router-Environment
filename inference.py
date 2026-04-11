@@ -69,11 +69,19 @@ TASK_TYPES = [
     "routing-expert",
 ]
 
-# Score calibration: optimal agent delivers ~12 reward/step on high-priority pkts
-_MAX_REWARD_PER_STEP = 12.0
-MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
+# Score calibration.
+# _MAX_REWARD_PER_STEP is the expected per-step reward for a strong agent.
+# Weighted across priorities (40% low ×0.5, 40% medium ×1.0, 20% high ×2.0),
+# a consistently delivered packet earns ~13–14/step.  Setting the denominator
+# to 15 means an excellent agent scores ~0.90 rather than being clamped at 0.999.
+_MAX_REWARD_PER_STEP = 15.0
+MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP  # 50 × 15 = 750
 
-SUCCESS_SCORE_THRESHOLD = 0.35  # normalised [0, 1]
+# SUCCESS_SCORE_THRESHOLD: 0.55 requires 412 cumulative reward over 50 steps
+# (8.25/step average), corresponding to ~75–80% packet delivery with low
+# penalty incidence.  The old value (0.35) only required ~50% delivery rate —
+# a mediocre agent could pass without really learning to route well.
+SUCCESS_SCORE_THRESHOLD = 0.55  # normalised [0, 1]
 
 # ---------------------------------------------------------------------------
 # System prompt

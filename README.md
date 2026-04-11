@@ -13,262 +13,255 @@ tags:
 
 # Smart Router Environment
 
-An OpenEnv environment for training RL agents to optimize network routing. Agents learn to select between different network paths (Fiber, Copper, Satellite) to minimize latency and packet loss under dynamic network conditions.
+An OpenEnv environment for training RL agents to optimize network routing in a realistic multi-hop IP network. The agent acts as a specific router (R2) and makes per-hop forwarding decisions for packets arriving at its interfaces, while background traffic independently loads links and random burst events create dynamic congestion.
 
 **Features:**
-- 🌐 **Network Routing Simulation** - Choose between 3 network paths with different characteristics
-- 🎲 **Dynamic Chaos Mode** - Network conditions change unpredictably every 5 steps
-- 🎯 **LLM Judge System** - Evaluate agent actions with configurable personas (lenient/standard/strict)
-- 📈 **Curriculum Controller** - Automatic difficulty progression based on agent mastery
-- 🤖 **Multi-Backend LLM Client** - Supports OpenAI, HuggingFace, and Anthropic APIs
-- 🚀 **GRPO Training Template** - Ready-to-use training script with TRL + vLLM
-- 📊 **Reward Visualization** - Built-in plotting utilities for training analysis
+- 🌐 **Multi-Hop Network Graph** — 5-to-14 node topologies with real router-to-router links and per-link latency/capacity/loss characteristics
+- 📦 **Packet Simulation** — Each packet has source, destination, priority (low/medium/high), TTL, and a visited-node list for cycle detection
+- 🚦 **Background Traffic Engine** — Independent flows and burst events load links, creating realistic congestion the agent must route around
+- 📋 **Per-Router Forwarding Table (FIB)** — Dijkstra-computed shortest-path tables are visible to the agent, like real routing protocols
+- 🔄 **Dynamic Topology** — Network graph grows in size and complexity as curriculum difficulty increases (5 nodes at warmup → 14 nodes at expert)
+- ⚠️ **Penalty System** — Invalid hops (non-neighbour index), routing loops (cycle in visited), and TTL expiry all produce negative rewards
+- 📈 **Curriculum Controller** — Automatic difficulty progression based on agent mastery
+- 🎯 **LLM Judge System** — Evaluate agent actions with configurable personas (lenient/standard/strict)
+- 🤖 **Multi-Backend LLM Client** — Supports OpenAI, HuggingFace, and Anthropic APIs
+- 🚀 **GRPO Training Template** — Ready-to-use training script with TRL + vLLM
+
+---
 
 ## How It Works
 
-The agent must route network traffic by selecting one of three paths at each step:
+### The Agent's Role
 
-| Path | ID | Normal Latency | Packet Loss | Behavior |
-|------|-----|----------------|-------------|----------|
-| **Fiber** | 0 | 10ms | 0.01 | Best performance, but degrades to 90ms + 0.10 loss during chaos |
-| **Copper** | 1 | 45ms | 0.02 | Consistent medium performance |
-| **Satellite** | 2 | 500ms | 0.00 | High latency but zero packet loss |
+The agent IS router **R2**. Every step, a packet arrives at R2 that needs to be forwarded toward its destination. The agent inspects the packet and the current state of its outgoing links, then picks a next-hop by index.
 
-**Chaos Mode**: Periodically (interval depends on difficulty), Fiber becomes the worst option. Agents must learn to detect congestion and switch paths.
+```
+episode: generate_topology(difficulty) → build FIB → init TrafficEngine
+              ↓
+step:  packet arrives at R2
+       agent picks next_hop_index (integer index into link_states)
+       env: validate → simulate_remainder_via_FIB → TrafficEngine.advance()
+       reward = delivery_quality + progress + congestion_penalty + penalty_flags
+       next observation (next packet)
+```
 
-**Progressive Difficulty** (Curriculum Learning):
-- **Easy**: Chaos every 10 steps, 20-step episodes, predictable
-- **Medium**: Chaos every 6-7 steps, 50-step episodes  
-- **Hard**: Chaos every 3 steps, 100-step episodes, ±5ms noise added
-- Automatically advances as agent improves
+### Network Topology (scales with difficulty)
 
-**Reward Function**: Base + Shaping
-- Base: `(100.0 / (latency + 1)) - (packet_loss * 50)`
-- Switching penalty: -0.5 (discourages thrashing)
-- Anticipation bonus: +1.0 (rewards predicting chaos)
-- Consistency bonus: +0.3 (rewards stable performance)
+| Tier | Difficulty | Nodes | Links | Background flows |
+|------|-----------|-------|-------|-----------------|
+| Warmup | 0.0–0.25 | 5 | 6 | 2–4 |
+| Beginner | 0.25–0.40 | 7 | 10 | 4–7 |
+| Intermediate | 0.40–0.60 | 9 | 14 | 7–12 |
+| Advanced | 0.60–0.80 | 11 | 20 | 12–18 |
+| Expert | 0.80–1.00 | 14 | 28 | 18–30 |
+
+R2 is always placed at a high-betweenness-centrality position so that most traffic flows through it.
+
+### Packets
+
+Each packet has:
+- **src / dst** — origin and destination router names
+- **priority** — 0 (low), 1 (medium), 2 (high); affects reward magnitude
+- **TTL** — time-to-live; decrements per hop, packet dropped at 0
+- **visited** — list of routers already traversed; picking one = cycle = penalty
+
+### Background Traffic & Bursts
+
+The `TrafficEngine` maintains concurrent flows between random router pairs. Each step:
+1. Flows age and expire.
+2. New flows spawn to maintain the target count (scales with difficulty).
+3. With 5–20% probability (scales with difficulty), a burst event fires — a random path gets 300–600 Mbps of spike load for 3–10 steps.
+4. Per-link loads are recomputed; this changes the effective latency and utilisation the agent observes.
+
+### Forwarding Information Base (FIB)
+
+At episode start, Dijkstra is run from every node to compute shortest-path next-hops. The FIB is exposed to the agent as `fib: List[FIBEntry]` — the same information a real router's routing table provides. The agent can follow it or deviate (e.g., to load-balance around congestion).
+
+### Reward Function
+
+| Situation | Base Reward | Priority Multiplier |
+|-----------|-------------|---------------------|
+| Delivered, low total latency | +10 to +15 | × 0.5 / 1.0 / 2.0 |
+| Delivered, high latency | +10 | × priority |
+| Remainder path lost packet | −3 | × priority |
+| Invalid index (out of range) | −10 | × priority |
+| Cycle detected (in visited) | −8 | × priority |
+| TTL expired | −5 | × priority |
+| Intentional drop (−1) | −1 | × priority |
+| Progress toward dst (+1 hop closer) | +2 | × priority |
+| Congestion penalty (util > 70 %) | up to −4 | × priority |
+| Load-balance bonus (smart FIB deviation) | +1.5 | × priority |
+| Bad deviation (chose congested over clear FIB) | −1.0 | × priority |
+| Consistency bonus (low reward variance) | +0.3 | — |
+
+---
 
 ## Quick Start
 
-### Basic Usage
-
-```python
-from smart_router import SmartRouterEnv, SmartRouterAction
-
-# Connect to the environment
-with SmartRouterEnv(base_url="http://localhost:8000") as env:
-    # Reset to start
-    result = env.reset()
-    print(f"Latency: {result.observation.latency_ms}ms")
-    print(f"Packet Loss: {result.observation.packet_loss}")
-    print(f"Congested: {result.observation.is_congested}")
-    
-    # Select Fiber path (ID=0)
-    result = env.step(SmartRouterAction(path_selection=0))
-    print(f"Reward: {result.reward:.2f}")
-    
-    # Detect congestion and switch to Copper
-    if result.observation.is_congested:
-        result = env.step(SmartRouterAction(path_selection=1))
-```
-
-### Run the Example Agent
-
-The repository includes a simple adaptive agent that switches between Fiber and Copper based on congestion:
+### Run the Example Agent (no server needed)
 
 ```bash
 # Start the environment server
 uv run server
 
-# In another terminal, run the agent
+# In another terminal, run the reactive agent
 python run_agent.py
 ```
 
-**Agent Logic**:
-```python
-is_congested = observation.is_congested
-action = 1 if is_congested else 0  # Copper if congested, else Fiber
+The agent follows the FIB suggestion unless the link is congested, then picks the least-loaded valid alternative. Example output:
+
+```
+Step    1 | idx=1(R3) 12.1ms util=0.21          | reward=  +9.80 | pkt=a3f1b2 R0->R9 pri=2 ttl=21 | delivered=True  | flows=8 net=0.22
+Step    2 | idx=0(R1) 45.2ms util=0.83           | reward= -12.40 | pkt=c7d9e1 R4->R8 pri=2 ttl=12 | delivered=False | flows=9 net=0.35 | ERR:REMAINDER_FAIL:STOCHASTIC_LOSS
+Step    3 | idx=2(R5) 8.4ms util=0.14            | reward= +14.20 | pkt=f0a2b3 R1->R9 pri=2 ttl=21 | delivered=True  | flows=8 net=0.27
 ```
 
-### Using Docker
+### Run Inference (primary evaluation)
 
-```python
-from smart_router import SmartRouterEnv
-
-# Automatically start container and connect
-env = SmartRouterEnv.from_docker_image("smart_router-env:latest")
-try:
-    result = env.reset()
-    result = env.step(SmartRouterAction(path_selection=0))
-    print(f"Reward: {result.reward:.2f}")
-finally:
-    env.close()
-```
-
-Build the Docker image first:
 ```bash
-docker build -t smart_router-env:latest -f server/Dockerfile .
+export HF_TOKEN=hf_your_token_here
+export MODEL_NAME=google/gemma-4-31B-it
+
+python inference.py
 ```
 
-## Environment Details
+`inference.py` is the primary evaluation file. It runs all five task scenarios in sequence:
+
+| Task | Topology | Focus |
+|------|----------|-------|
+| `routing-basic` | 5 nodes, low load | Baseline forwarding |
+| `routing-congested` | 9 nodes, heavy background flows | Congestion avoidance |
+| `routing-burst` | 9 nodes, frequent bursts | Burst reaction |
+| `routing-multihop` | 11 nodes, long paths | Multi-hop planning |
+| `routing-expert` | 14 nodes, max load + bursts | Full complexity |
+
+**Output format:**
+```
+[START] task=routing-expert env=smart_router model=gemma-4-31B nodes=14 links=28 agent=R2
+[STEP] step=1 action=1(R3) reward=+12.40 done=false packet=a3f1 src=R0 dst=R9 pri=high ttl=21 fib=R3 delivered=true total_lat=67.2ms link_lat=10.3ms util=0.28 active_flows=22 net_util=0.61 error=null
+[STEP] step=2 action=0(R1) reward=-16.00 done=false packet=b7c2 src=R4 dst=R8 pri=high ttl=3 fib=R1 delivered=None total_lat=None link_lat=None util=None active_flows=23 net_util=0.63 error=CYCLE:R1_already_in_visited
+[END] success=true steps=50 score=0.712 rewards=12.40,-16.00,... delivered=38 dropped=12 delivery_rate=0.760 avg_latency=71.3ms
+```
+
+### Direct API Usage
+
+```python
+from smart_router import SmartRouterEnv, SmartRouterAction
+
+with SmartRouterEnv(base_url="http://localhost:8000") as env:
+    result = env.reset()
+    obs = result.observation
+
+    print(f"Agent router: {obs.agent_router}")          # R2
+    print(f"Packet: {obs.packet.src} → {obs.packet.dst}")
+    print(f"Priority: {obs.packet.priority}")
+    print(f"TTL: {obs.packet.ttl}")
+    print(f"Visited: {obs.packet.visited}")
+
+    # Show available links
+    for link in obs.link_states:
+        print(f"  [{link.index}] {link.neighbor}: {link.latency_ms}ms util={link.utilization:.2f}")
+
+    # Show FIB suggestion
+    for entry in obs.fib:
+        if entry.destination == obs.packet.dst:
+            print(f"FIB suggests: {entry.next_hops}")
+
+    # Forward to neighbour at index 1
+    result = env.step(SmartRouterAction(next_hop_index=1))
+    print(f"Reward: {result.reward:.2f}")
+```
+
+---
+
+## Environment API
 
 ### Action
 
-**SmartRouterAction**
-- `path_selection` (int, 0-2): Network path to use
-  - `0` = Fiber
-  - `1` = Copper  
-  - `2` = Satellite
+**`SmartRouterAction`**
+- `next_hop_index` (int, ≥ −1):
+  - `−1` = intentionally drop the packet (mild penalty)
+  - `0 … N−1` = forward to the neighbour at that index in `link_states`
+  - Out-of-range index → large penalty, packet dropped
 
 ### Observation
 
-**SmartRouterObservation**
-- `latency_ms` (float): Network latency in milliseconds
-- `packet_loss` (float): Packet loss rate (0.0-1.0)
-- `is_congested` (bool): True if latency > 60ms
+**`SmartRouterObservation`**
 
-### Reward
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_router` | str | The router the agent controls (always `"R2"`) |
+| `packet` | PacketInfo | Current packet awaiting forwarding |
+| `link_states` | List[LinkState] | One entry per outgoing link |
+| `fib` | List[FIBEntry] | Forwarding table (Dijkstra suggestions) |
+| `queue_size` | int | Packets pending at agent router |
+| `active_flow_count` | int | Background flows currently active |
+| `network_utilization` | float | Average utilisation across all links |
 
-Base reward: **`(100.0 / (latency + 1)) - (packet_loss * 50)`**
+**`PacketInfo`**
 
-**Reward Shaping** (helps agent learn better strategies):
-- **Switching penalty**: -0.5 when changing paths (simulates BGP convergence cost)
-- **Anticipation bonus**: +1.0 for switching to Copper before chaos hits
-- **Consistency bonus**: +0.3 for maintaining stable performance (low variance)
+| Field | Type | Description |
+|-------|------|-------------|
+| `packet_id` | str | Unique identifier |
+| `src` | str | Originating router |
+| `dst` | str | Destination router |
+| `priority` | int | 0=low, 1=medium, 2=high |
+| `ttl` | int | Remaining hops before expiry |
+| `hops_taken` | int | Hops completed so far |
+| `visited` | List[str] | Routers already traversed |
 
-Examples:
-- Fiber (normal): latency=10ms, loss=0.01 → base reward ≈ 8.59
-- Fiber (chaos): latency=90ms, loss=0.10 → base reward ≈ -3.90
-- Copper: latency=45ms, loss=0.02 → base reward ≈ 1.17
-- Satellite: latency=500ms, loss=0.00 → base reward ≈ 0.20
+**`LinkState`**
 
-**Curriculum Effects**:
-- At higher difficulties, latency gets random noise (±5ms)
-- Episode length increases from 20 steps (easy) to 100 steps (hard)
-- Chaos becomes more frequent (every 10 steps → every 3 steps)
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | int | Action index to use |
+| `neighbor` | str | Router this link connects to |
+| `latency_ms` | float | Current effective latency (base + queuing delay) |
+| `utilization` | float | 0.0–1.0 fraction of capacity used |
+| `queue_depth` | int | Approximate packets queued |
+| `is_congested` | bool | True when utilization > 0.75 |
+
+**`FIBEntry`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `destination` | str | Destination router name |
+| `next_hops` | List[str] | `[primary, alt]` next-hop router names |
+
+---
 
 ## Advanced Features
-
-This environment includes production-ready features for RL agent training.
 
 ### Curriculum Learning (Integrated)
 
 The environment automatically adjusts difficulty based on agent performance:
 
 ```python
-# Curriculum is integrated into the environment automatically
-from smart_router import SmartRouterEnv
-
-env = SmartRouterEnv(base_url="http://localhost:8000")
-
-# First reset: Easy (chaos every 10 steps, 20 step episodes)
-result = env.reset()
-print(f"Chaos interval: {result.info['chaos_interval']}")  # 10
-print(f"Max steps: {result.info['max_steps']}")  # 20
-
-# As agent succeeds, curriculum increases difficulty
-# After many successful episodes: Hard (chaos every 3 steps, 100 step episodes)
+result = env.step(SmartRouterAction(next_hop_index=0))
+print(result.info['difficulty'])        # 0.0–1.0
+print(result.info['curriculum_tier'])   # "warmup", "beginner", …, "expert"
+print(result.info['graph_nodes'])       # 5, 7, 9, 11, or 14
+print(result.info['active_flows'])      # background flows this step
+print(result.info['packets_delivered']) # cumulative delivered this episode
+print(result.info['avg_delivery_latency_ms'])  # cumulative average
 ```
 
-**How it works:**
-- Tracks agent success rate over recent episodes
-- **Easier levels**: Chaos every 10 steps, shorter 20-step episodes
-- **Harder levels**: Chaos every 3 steps, longer 100-step episodes, latency noise
-- Automatically advances through: warmup → beginner → intermediate → advanced → expert
-- Fast-track: 90%+ success rate advances immediately
+Tier progression: **warmup → beginner → intermediate → advanced → expert**
 
-**Curriculum stats available in step info:**
-```python
-result = env.step(SmartRouterAction(path_selection=0))
-print(result.info['difficulty'])  # 0.0-1.0
-print(result.info['curriculum_tier'])  # "warmup", "beginner", etc.
-```
+Fast-track: 90 %+ success in 3 consecutive episodes advances immediately.
 
 ### LLM Judge (Offline Evaluation Only)
 
-**Important**: The LLM judge is for **offline evaluation**, not online training.
-
-Evaluate trained agent policies:
-
-```python
-from server.llm_client import LLMClient
-from server.judge import LLMJudge
-
-# Set up LLM backend (reads LLM_BACKEND env var)
-llm = LLMClient()
-judge = LLMJudge(llm)
-
-# Run episode with your trained agent
-agent = load_trained_agent("checkpoints/routing-agent")
-env = SmartRouterEnv(base_url="http://localhost:8000")
-result = env.reset()
-history = []
-
-for step in range(100):
-    action = agent.predict(result.observation)
-    result = env.step(SmartRouterAction(path_selection=action))
-    
-    # Evaluate action quality offline (not used for training)
-    score, feedback = judge.evaluate(
-        action=f"path_selection: {action}",
-        observation=f"latency: {result.observation.latency_ms}ms",
-        context={
-            "task_description": "Optimize network routing",
-            "goal": "Minimize latency and packet loss",
-        },
-        history=history,
-        persona="strict"
-    )
-    
-    history.append({
-        "step": step,
-        "action": action,
-        "judge_score": score,
-        "feedback": feedback
-    })
-
-# Analyze results
-avg_judge_score = sum(h['judge_score'] for h in history) / len(history)
-print(f"Average judge score: {avg_judge_score:.2f}")
-```
-
-**Why offline only?**
-- Each judge call takes 200-500ms (too slow for training)
-- Cost: $0.10-1.00 per 100-step episode with API providers
-- LLM outputs vary, creating noisy gradients
-
-See **[JUDGE_USAGE.md](JUDGE_USAGE.md)** for detailed examples and best practices.
-
-**Configure LLM Backend:**
-
-```bash
-# Use Anthropic Claude (recommended for production)
-export LLM_BACKEND=anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Use OpenAI-compatible (vLLM, OpenAI)
-export LLM_BACKEND=openai
-export LLM_BASE_URL=http://localhost:8001/v1
-export LLM_MODEL=gpt-3.5-turbo
-
-# Use HuggingFace Inference API
-export LLM_BACKEND=hf
-export HF_TOKEN=hf_...
-export LLM_MODEL=Qwen/Qwen3-14B
-```
+The judge is for offline evaluation, not online training. See `server/judge.py` for usage.
 
 ### GRPO Training
 
-Train agents using Group Relative Policy Optimization with the included template:
+Train agents using Group Relative Policy Optimization:
 
 ```bash
-# Install training dependencies
 pip install -e ".[train]"
-
-# Start environment server
 uv run server
 
-# Train agent (in separate terminal)
 python train_template.py \
   --model-id Qwen/Qwen3-0.6B \
   --env-url http://localhost:8000 \
@@ -277,193 +270,53 @@ python train_template.py \
   --output-dir outputs/routing-agent
 ```
 
-**Training features:**
-- Multi-turn episode support
-- Conversation history tracking
-- LoRA fine-tuning
-- Automatic checkpoint saving
-- CSV reward logging
-- HuggingFace Hub integration
-
 ### Reward Visualization
-
-Plot training progress from reward logs:
 
 ```bash
 python plot_rewards.py outputs/routing-agent/reward_log.csv
 ```
 
-Generates a plot with:
-- Per-episode rewards
-- Rolling average (10 episodes)
-- Trend line with slope
-- Summary statistics
+---
 
 ## Deploying to Hugging Face Spaces
 
-Deploy your environment to HuggingFace Spaces using the OpenEnv CLI:
-
 ```bash
-# From the environment directory
 openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
+# or
+openenv push --repo-id my-org/smart-router --private
 ```
 
-The `openenv push` command will:
-1. Validate the OpenEnv environment
-2. Prepare a custom build for HuggingFace Docker space
-3. Upload to HuggingFace
+After deployment:
+- **Web Interface** — `/web`
+- **API Documentation** — `/docs`
+- **Health Check** — `/health`
+- **WebSocket** — `/ws`
 
-### Prerequisites
+---
 
-Authenticate with HuggingFace (the command will prompt if needed):
-```bash
-huggingface-cli login
+## Project Structure
+
 ```
-
-### Options
-
-- `--directory`, `-d`: Directory containing the environment (default: current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name'
-- `--base-image`, `-b`: Base Docker image to use
-- `--private`: Deploy as private space
-
-### Examples
-
-```bash
-# Push to your personal namespace
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/smart-router
-
-# Push as a private space
-openenv push --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you have a Smart Router environment server running elsewhere:
-
-```python
-from smart_router import SmartRouterEnv
-
-# Connect to existing server (won't stop it on close)
-env = SmartRouterEnv(base_url="https://my-server.com")
-result = env.reset()
-result = env.step(SmartRouterAction(path_selection=0))
-```
-
-### Context Manager Pattern
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from smart_router import SmartRouterAction, SmartRouterEnv
-
-with SmartRouterEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    
-    # Run episode
-    for step in range(100):
-        # Simple strategy: use Fiber unless congested
-        action = 1 if result.observation.is_congested else 0
-        result = env.step(SmartRouterAction(path_selection=action))
-        
-        if result.done:
-            break
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this, modify `server/app.py`:
-
-```python
-app = create_app(
-    SmartRouterEnvironment,  # Pass class, not instance
-    SmartRouterAction,
-    SmartRouterObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then run multiple clients simultaneously:
-
-```python
-from smart_router import SmartRouterAction, SmartRouterEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with SmartRouterEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        total_reward = 0
-        
-        for i in range(100):
-            action = 1 if result.observation.is_congested else 0
-            result = env.step(SmartRouterAction(path_selection=action))
-            total_reward += result.reward
-            
-            if result.done:
-                break
-                
-        return client_id, total_reward
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-    
-for client_id, reward in results:
-    print(f"Client {client_id}: Total reward = {reward:.2f}")
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic without starting the HTTP server:
-
-```bash
-python server/smart_router_environment.py
-```
-
-This verifies:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-- Chaos mode triggers appropriately
-
-### Running Locally
-
-Run the server locally for development:
-
-```bash
-# With auto-reload
-uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-
-# Or using the entry point
-uv run server
-
-# With custom port
-uv run server --port 8001
+smart_router/
+├── __init__.py                      # Module exports
+├── README.md                        # This file
+├── inference.py                     # Primary evaluation script (5 task types)
+├── run_agent.py                     # Reactive greedy example agent
+├── client.py                        # SmartRouterEnv client (WebSocket)
+├── models.py                        # Action / Observation data models
+├── train_template.py                # GRPO training script template
+├── plot_rewards.py                  # Reward visualization utilities
+├── openenv.yaml                     # OpenEnv manifest
+├── pyproject.toml                   # Project metadata and dependencies
+└── server/
+    ├── smart_router_environment.py  # Core environment (reset/step/reward)
+    ├── topology.py                  # Network graph blueprints + FIB computation
+    ├── traffic_engine.py            # Background traffic flows and burst events
+    ├── curriculum.py                # Automatic difficulty progression
+    ├── app.py                       # FastAPI application (HTTP + WebSocket)
+    ├── judge.py                     # LLM-based action evaluator (offline)
+    ├── llm_client.py                # Multi-backend LLM client
+    └── Dockerfile                   # Container image definition
 ```
 
 ## Installation
@@ -477,64 +330,4 @@ pip install -e ".[train]"
 
 # With evaluation tools
 pip install -e ".[eval]"
-
-# Development mode
-pip install -e ".[dev]"
-```
-
-## Inference Script
-
-For benchmarking and competitions, use the standardized inference script:
-
-```bash
-# Set up environment
-export HF_TOKEN=hf_your_token_here
-export LOCAL_IMAGE_NAME=smart_router-env:latest
-export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-
-# Run inference
-python inference.py
-```
-
-**Output format:**
-```
-[START] task=routing env=smart_router model=Qwen/Qwen2.5-72B-Instruct
-[STEP] step=1 action=0(Fiber) reward=8.09 done=false error=null
-[STEP] step=2 action=1(Copper) reward=1.67 done=false error=null
-...
-[END] success=true steps=100 score=0.847 rewards=8.09,1.67,...
-```
-
-See **[INFERENCE_README.md](INFERENCE_README.md)** for detailed usage.
-
-## Project Structure
-
-```
-smart_router/
-├── .dockerignore                    # Docker build exclusions
-├── .gitignore                       # Git exclusions
-├── __init__.py                      # Module exports
-├── README.md                        # This file
-├── INFERENCE_README.md              # Inference script documentation
-├── JUDGE_USAGE.md                   # LLM Judge usage guide (offline evaluation)
-├── ANALYSIS_REWARD_CURRICULUM.md   # Design analysis and recommendations
-├── CHANGES_SUMMARY.md               # Summary of recent improvements
-├── inference.py                     # Standardized inference script
-├── openenv.yaml                     # OpenEnv manifest
-├── pyproject.toml                   # Project metadata and dependencies
-├── requirements.txt                 # Generated dependencies
-├── client.py                        # SmartRouterEnv client
-├── models.py                        # Action and Observation models
-├── run_agent.py                     # Example adaptive agent
-├── train_template.py                # GRPO training script template
-├── plot_rewards.py                  # Reward visualization utilities
-└── server/
-    ├── __init__.py                  # Server module exports
-    ├── smart_router_environment.py  # Core environment logic
-    ├── app.py                       # FastAPI application (HTTP + WebSocket)
-    ├── llm_client.py                # Multi-backend LLM client (OpenAI/HF/Anthropic)
-    ├── judge.py                     # LLM-based action evaluator
-    ├── curriculum.py                # Automatic difficulty progression
-    ├── Dockerfile                   # Container image definition
-    └── requirements.txt             # Server-specific dependencies
 ```
