@@ -2,167 +2,321 @@
 Inference Script for Smart Router Environment
 ==============================================
 
+PRIMARY EVALUATION FILE — runs all five task scenarios and validates the entire
+multi-hop network simulation:
+
+  routing-basic       warmup topology   (5 nodes), low background traffic
+  routing-congested   intermediate      (9 nodes), heavy background flows
+  routing-burst       intermediate      (9 nodes), frequent burst events
+  routing-multihop    advanced          (11 nodes), many hops required
+  routing-expert      expert            (14 nodes), max flows + frequent bursts
+
 MANDATORY REQUIREMENTS:
-- Before submitting, ensure the following variables are defined in your environment configuration:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
+  API_BASE_URL   LLM endpoint            (default: https://router.huggingface.co/v1)
+  MODEL_NAME     Model identifier        (default: Qwen/Qwen2.5-72B-Instruct)
+  HF_TOKEN       API key
 
-- Defaults are set only for API_BASE_URL and MODEL_NAME
-    (and should reflect your active inference setup):
-    API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-    MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-
-- The environment runs entirely in-process - no server or Docker required
-
-- The inference script must be named `inference.py` and placed in the root directory of the project
-- Participants must use OpenAI Client for all LLM calls using above variables
+  The environment runs entirely in-process — no server or Docker required.
+  This file must be named inference.py and placed in the project root.
+  Use the OpenAI client for LLM calls.
 
 STDOUT FORMAT
-- The script must emit exactly three line types to stdout, in this order:
-
-    [START] task=<task_name> env=<benchmark> model=<model_name>
-    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
-
-  Rules:
-    - One [START] line at episode begin.
-    - One [STEP] line per step, immediately after env.step() returns.
-    - One [END] line after env.close(), always emitted (even on exception).
-    - reward and rewards are formatted to 2 decimal places.
-    - done and success are lowercase booleans: true or false.
-    - error is the raw last_action_error string, or null if none.
-    - All fields on a single line with no newlines within a line.
-    - Each tasks should return score in [0, 1]
+  [START] task=<name> env=smart_router model=<model> nodes=<n> links=<l> agent=<r>
+  [STEP]  step=<n> action=<idx>(<nbr>) reward=<r> done=<bool> ...details...
+  [END]   success=<bool> steps=<n> score=<s> rewards=<r1,...>
+          delivered=<n> dropped=<n> delivery_rate=<f> avg_latency=<f>ms
 
   Example:
-    [START] task=routing env=smart_router model=Qwen/Qwen2.5-72B-Instruct
-    [STEP] step=1 action=0(Fiber) reward=8.59 done=false error=null
-    [STEP] step=2 action=0(Fiber) reward=8.09 done=false error=null
-    [STEP] step=3 action=1(Copper) reward=1.67 done=false error=null
-    [END] success=true steps=3 score=0.847 rewards=8.59,8.09,1.67
+    [START] task=routing-expert env=smart_router model=Qwen2.5-72B nodes=14 links=28 agent=R2
+    [STEP] step=1 action=1(R3) reward=+12.40 done=false packet=a3f1 src=R0 dst=R9 \\
+           pri=high ttl=21 fib_suggested=R3 delivered=true total_lat=67.2ms \\
+           link_lat=10.3ms util=0.28 active_flows=22 net_util=0.61 error=null
+    [STEP] step=2 action=0(R1) reward=-16.00 done=false packet=b7c2 src=R4 dst=R8 \\
+           pri=high ttl=3 error=CYCLE:R1_already_in_visited
+    [END] success=true steps=50 score=0.712 rewards=12.40,-16.00,...
+          delivered=38 dropped=12 delivery_rate=0.76 avg_latency=71.3ms
 """
 
 import os
 import textwrap
+import time
 from typing import List, Optional
 
 from openai import OpenAI
 from smart_router import SmartRouterAction, SmartRouterObservation
+
 from server.smart_router_environment import SmartRouterEnvironment
 
-# Configuration - following MANDATORY requirements
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-4-31B-it")
 
 BENCHMARK = os.getenv("SMART_ROUTER_BENCHMARK", "smart_router")
-MAX_STEPS = 15
-TEMPERATURE = 0.7
-MAX_TOKENS = 50
-SUCCESS_SCORE_THRESHOLD = 0.5  # normalized score in [0, 1]
+MAX_STEPS = 50
+TEMPERATURE = 0.3
+MAX_TOKENS = 20  # agent only needs to output a single integer
 
-# Estimate for max possible reward (optimal strategy: ~7 reward/step)
-_MAX_REWARD_PER_STEP = 7.0
+# Five task types that together exercise every feature of the simulation
+TASK_TYPES = [
+    "routing-basic",
+    "routing-congested",
+    "routing-burst",
+    "routing-multihop",
+    "routing-expert",
+]
+
+# Score calibration: optimal agent delivers ~12 reward/step on high-priority pkts
+_MAX_REWARD_PER_STEP = 12.0
 MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
 
-# Define 3 task types for hackathon validation
-TASK_TYPES = ["routing", "routing-congested", "routing-stable"]
+SUCCESS_SCORE_THRESHOLD = 0.35  # normalised [0, 1]
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are a network routing optimizer controlling path selection for network traffic.
+    You are router R2 in a multi-hop IP network. Your job is to forward each
+    arriving packet to the best next-hop router.
 
-    PATHS AVAILABLE:
-    0 = Fiber:     Low latency (10ms) but degrades during congestion (90ms + high packet loss)
-    1 = Copper:    Medium latency (45ms) but consistent and reliable
-    2 = Satellite: High latency (500ms) but zero packet loss
+    ── HOW TO READ YOUR OBSERVATION ──────────────────────────────────────────
+    Each step you see:
+      • PACKET  — the packet to forward: source, destination, priority,
+                  TTL (time-to-live), and visited[] (routers already traversed)
+      • LINKS   — your outgoing links, each with:
+                    index      : the integer to output as your action
+                    neighbor   : name of the router this link connects to
+                    latency_ms : current one-way delay (base + queuing)
+                    utilization: fraction of capacity used (0.0 = idle, 1.0 = full)
+                    is_congested: True if utilization > 0.75
+      • FIB     — your forwarding table (Dijkstra shortest-path suggestions)
+      • Network summary: background flows, average network utilization
 
-    OBSERVATIONS:
-    - latency_ms: Current network latency in milliseconds
-    - packet_loss: Packet loss rate (0.0 = none, 1.0 = total loss)
-    - is_congested: Boolean indicating if latency > 60ms
+    ── RULES ─────────────────────────────────────────────────────────────────
+    1. NEVER pick a neighbor that is already in packet.visited  → CYCLE penalty
+    2. If TTL ≤ 2, output -1 (drop) — the cost is lower than wasting the hop
+    3. Follow the FIB suggestion unless that link is_congested
+    4. When the FIB link is congested, pick the least-loaded valid alternative
+    5. An index out of range is invalid → large penalty
 
-    STRATEGY:
-    - Fiber is best under normal conditions (high reward ~8)
-    - When congested (is_congested=true), switch to Copper immediately
-    - Avoid Satellite unless absolutely necessary
-    - Learn to anticipate congestion patterns and switch proactively
+    ── REWARD SIGNALS ────────────────────────────────────────────────────────
+    Delivered packet (fast)  +10 to +15  × priority_mult
+    Invalid index            -10         × priority_mult
+    Cycle detected           -8          × priority_mult
+    TTL expired              -5          × priority_mult
+    Intentional drop (-1)    -1          × priority_mult
+    Progress toward dst      +2/hop      × priority_mult
+    Congestion (util>70 %)   up to -4    × priority_mult
+    Load-balance bonus       +1.5        when you smartly avoid congested FIB
+    priority_mult: low=0.5, medium=1.0, high=2.0
 
-    OUTPUT FORMAT:
-    Reply with ONLY a single digit: 0, 1, or 2
-    No explanations, no quotes, just the path number.
+    ── OUTPUT FORMAT ─────────────────────────────────────────────────────────
+    Reply with ONE integer only — the link index (e.g. 0, 1, 2 …) or -1 to drop.
+    No punctuation, no explanation, no quotes.  Just the number.
     """
 ).strip()
 
 
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+
+def log_start(task: str, model: str, nodes: int, links: int, agent: str) -> None:
+    print(
+        f"[START] task={task} env={BENCHMARK} model={model} "
+        f"nodes={nodes} links={links} agent={agent}",
+        flush=True,
+    )
 
 
 def log_step(
-    step: int, action: str, reward: float, done: bool, error: Optional[str]
+    step: int,
+    action_idx: int,
+    neighbor: str,
+    reward: float,
+    done: bool,
+    packet_id: str,
+    src: str,
+    dst: str,
+    priority: str,
+    ttl: int,
+    fib_suggested: str,
+    delivered: Optional[bool],
+    total_lat: Optional[float],
+    link_lat: Optional[float],
+    link_util: Optional[float],
+    active_flows: int,
+    net_util: float,
+    error: Optional[str],
 ) -> None:
-    error_val = error if error else "null"
-    done_val = str(done).lower()
+    action_str = f"{action_idx}({neighbor})" if neighbor else str(action_idx)
+    delivered_str = str(delivered).lower() if delivered is not None else "n/a"
+    lat_str = f"{total_lat:.1f}ms" if total_lat is not None else "n/a"
+    link_lat_str = f"{link_lat:.1f}ms" if link_lat is not None else "n/a"
+    util_str = f"{link_util:.2f}" if link_util is not None else "n/a"
+    error_str = error if error else "null"
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        f"[STEP] step={step} action={action_str} reward={reward:+.2f} done={str(done).lower()} "
+        f"packet={packet_id} src={src} dst={dst} pri={priority} ttl={ttl} "
+        f"fib={fib_suggested} delivered={delivered_str} total_lat={lat_str} "
+        f"link_lat={link_lat_str} util={util_str} "
+        f"active_flows={active_flows} net_util={net_util:.2f} error={error_str}",
         flush=True,
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(
+    success: bool,
+    steps: int,
+    score: float,
+    rewards: List[float],
+    delivered: int,
+    dropped: int,
+    avg_latency: float,
+) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    total = delivered + dropped
+    rate = delivered / total if total else 0.0
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} "
+        f"rewards={rewards_str} "
+        f"delivered={delivered} dropped={dropped} "
+        f"delivery_rate={rate:.3f} avg_latency={avg_latency:.1f}ms",
         flush=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
 
 
 def build_user_prompt(
     step: int,
-    latency: float,
-    packet_loss: float,
-    is_congested: bool,
+    obs: SmartRouterObservation,
     last_action: Optional[int],
     last_reward: float,
     history: List[str],
 ) -> str:
-    """Build the prompt for the LLM based on current observation."""
-    history_block = "\n".join(history[-4:]) if history else "None"
-    status = "CONGESTED" if is_congested else "Normal"
+    packet = obs.packet
+    priority_label = ["LOW", "MEDIUM", "HIGH"][min(packet.priority, 2)]
+    visited_str = ", ".join(packet.visited) if packet.visited else "none"
+
+    # Link table
+    link_rows = []
+    for ls in obs.link_states:
+        cong = " [CONGESTED]" if ls.is_congested else ""
+        link_rows.append(
+            f"  [{ls.index}] {ls.neighbor:6s} | {ls.latency_ms:6.1f}ms "
+            f"| util={ls.utilization:.2f} | qdepth={ls.queue_depth}{cong}"
+        )
+    links_block = "\n".join(link_rows) if link_rows else "  (no links)"
+
+    # FIB suggestion for this packet's destination
+    fib_suggestion = _fib_lookup(obs.fib, packet.dst)
+    fib_str = (
+        (
+            f"primary={fib_suggestion.next_hops[0] if fib_suggestion and fib_suggestion.next_hops else '?'}"
+            f", alt={fib_suggestion.next_hops[1] if fib_suggestion and len(fib_suggestion.next_hops) > 1 else 'none'}"
+        )
+        if fib_suggestion
+        else "no FIB entry"
+    )
+
+    history_block = "\n".join(history[-4:]) if history else "none"
 
     return textwrap.dedent(
         f"""
-        Step: {step}
-        Status: {status}
-        Latency: {latency:.1f}ms | Packet Loss: {packet_loss:.2f} | Congested: {is_congested}
+        Step {step} | Router: {obs.agent_router} | Queue: {obs.queue_size} pending
+        Background flows: {obs.active_flow_count} | Network utilization: {obs.network_utilization:.0%}
 
-        Last Action: {last_action if last_action is not None else "None"}
-        Last Reward: {last_reward:.2f}
+        PACKET: {packet.packet_id}
+          src={packet.src}  dst={packet.dst}  priority={priority_label}  TTL={packet.ttl}
+          visited=[{visited_str}]
 
-        Recent History:
+        AVAILABLE LINKS (pick index, or -1 to drop):
+        {links_block}
+
+        FIB for {packet.dst}: {fib_str}
+
+        Last action: {last_action if last_action is not None else "none"}
+        Last reward: {last_reward:+.2f}
+
+        Recent history:
         {history_block}
 
-        Select path (0=Fiber, 1=Copper, 2=Satellite):
+        Select next_hop_index:
         """
     ).strip()
+
+
+def _fib_lookup(fib, dst: str):
+    """Return the FIBEntry for *dst*, or None."""
+    for entry in fib:
+        if entry.destination == dst:
+            return entry
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Fallback decision (no LLM / parse failure)
+# ---------------------------------------------------------------------------
+
+
+def _fallback_action(obs: SmartRouterObservation) -> int:
+    """
+    Greedy rule-based decision:
+    1. Follow FIB primary if uncongested and not in visited.
+    2. Else pick least-loaded uncongested valid neighbour.
+    3. Else pick least-loaded valid neighbour.
+    4. Else drop (-1).
+    """
+    packet = obs.packet
+    visited = set(packet.visited)
+    links = obs.link_states
+
+    if packet.ttl <= 2:
+        return -1
+
+    valid = [l for l in links if l.neighbor not in visited]
+    if not valid:
+        return -1
+
+    fib_entry = _fib_lookup(obs.fib, packet.dst)
+    primary = fib_entry.next_hops[0] if fib_entry and fib_entry.next_hops else None
+
+    if primary and primary not in visited:
+        primary_link = next((l for l in valid if l.neighbor == primary), None)
+        if primary_link and not primary_link.is_congested:
+            return primary_link.index
+
+    # Find best alternative
+    uncongested = [l for l in valid if not l.is_congested]
+    pool = uncongested if uncongested else valid
+    best = min(pool, key=lambda l: l.utilization * l.latency_ms)
+    return best.index
+
+
+# ---------------------------------------------------------------------------
+# LLM action
+# ---------------------------------------------------------------------------
 
 
 def get_model_action(
     client: OpenAI,
     step: int,
-    latency: float,
-    packet_loss: float,
-    is_congested: bool,
+    obs: SmartRouterObservation,
     last_action: Optional[int],
     last_reward: float,
     history: List[str],
 ) -> int:
-    """Get path selection from LLM using OpenAI client."""
-    user_prompt = build_user_prompt(
-        step, latency, packet_loss, is_congested, last_action, last_reward, history
-    )
+    user_prompt = build_user_prompt(step, obs, last_action, last_reward, history)
 
     try:
         completion = client.chat.completions.create(
@@ -177,22 +331,28 @@ def get_model_action(
         )
         text = (completion.choices[0].message.content or "").strip()
 
-        # Parse response - extract first digit (0, 1, or 2)
-        for char in text:
-            if char in "012":
-                return int(char)
+        # Parse: accept -1 or any non-negative integer
+        import re
 
-        # Fallback strategy: Copper if congested, else Fiber
-        return 1 if is_congested else 0
+        match = re.search(r"-?\d+", text)
+        if match:
+            idx = int(match.group())
+            if idx == -1 or 0 <= idx < len(obs.link_states):
+                return idx
+
+        return _fallback_action(obs)
 
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        # Fallback strategy
-        return 1 if is_congested else 0
+        return _fallback_action(obs)
 
 
-def run_task(task_name: str, client: OpenAI) -> None:
-    """Run inference episode for a specific task."""
+# ---------------------------------------------------------------------------
+# Task runner
+# ---------------------------------------------------------------------------
+
+
+def run_task(task_name: str, client: Optional[OpenAI]) -> None:
     env = SmartRouterEnvironment(task_type=task_name)
 
     history: List[str] = []
@@ -200,11 +360,22 @@ def run_task(task_name: str, client: OpenAI) -> None:
     steps_taken = 0
     score = 0.0
     success = False
-
-    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+    total_delivered = 0
+    total_dropped = 0
+    last_avg_latency = 0.0
 
     try:
         obs = env.reset()
+
+        # Log start with topology metadata
+        graph = env._graph
+        log_start(
+            task=task_name,
+            model=MODEL_NAME,
+            nodes=len(graph.nodes),
+            links=graph.link_count() // 2,
+            agent=graph.agent_router,
+        )
 
         last_action: Optional[int] = None
         last_reward = 0.0
@@ -214,49 +385,79 @@ def run_task(task_name: str, client: OpenAI) -> None:
             if done:
                 break
 
-            # Get action from model
-            action_id = get_model_action(
-                client,
-                step,
-                obs.latency_ms,
-                obs.packet_loss,
-                obs.is_congested,
-                last_action,
-                last_reward,
-                history,
-            )
+            # Get action from LLM (or fallback if no client)
+            if client is not None:
+                action_idx = get_model_action(
+                    client, step, obs, last_action, last_reward, history
+                )
+            else:
+                action_idx = _fallback_action(obs)
 
-            # Execute action
-            result = env.step(SmartRouterAction(path_selection=action_id))
-            obs = result.observation
+            # Execute
+            result = env.step(SmartRouterAction(next_hop_index=action_idx))
+            info = result.info or {}
+            new_obs: SmartRouterObservation = result.observation
             reward = result.reward or 0.0
             done = result.done
-            error = None
 
             rewards.append(reward)
             steps_taken = step
-            last_action = action_id
+            last_action = action_idx
             last_reward = reward
 
-            # Format action string for logging (no newlines)
-            path_names = {0: "Fiber", 1: "Copper", 2: "Satellite"}
-            action_str = f"{action_id}({path_names.get(action_id, '?')})"
+            # Resolve logged fields
+            chosen_link = next(
+                (l for l in obs.link_states if l.index == action_idx), None
+            )
+            neighbor_name = (
+                chosen_link.neighbor
+                if chosen_link
+                else ("DROP" if action_idx == -1 else "?")
+            )
+            priority_label = ["low", "medium", "high"][min(obs.packet.priority, 2)]
 
             log_step(
-                step=step, action=action_str, reward=reward, done=done, error=error
+                step=step,
+                action_idx=action_idx,
+                neighbor=neighbor_name,
+                reward=reward,
+                done=done,
+                packet_id=obs.packet.packet_id,
+                src=obs.packet.src,
+                dst=obs.packet.dst,
+                priority=priority_label,
+                ttl=obs.packet.ttl,
+                fib_suggested=info.get("fib_suggested", "?"),
+                delivered=info.get("delivered"),
+                total_lat=info.get("total_latency_ms"),
+                link_lat=info.get("link_latency_ms"),
+                link_util=info.get("link_utilization"),
+                active_flows=info.get("active_flows", 0),
+                net_util=new_obs.network_utilization,
+                error=info.get("error"),
+            )
+            time.sleep(1)  # Requests are being rate limited
+
+            # Build history entry for next prompt
+            history.append(
+                f"Step {step}: idx={action_idx}({neighbor_name}) "
+                f"pkt={obs.packet.packet_id} {obs.packet.src}->{obs.packet.dst} "
+                f"delivered={info.get('delivered', '?')} "
+                f"reward={reward:+.2f}"
             )
 
-            # Update history for next prompt
-            history.append(
-                f"Step {step}: {action_str} -> {obs.latency_ms:.0f}ms, reward={reward:+.2f}"
-            )
+            total_delivered = info.get("packets_delivered", 0)
+            total_dropped = info.get("packets_dropped", 0)
+            last_avg_latency = info.get("avg_delivery_latency_ms", 0.0)
+
+            obs = new_obs
 
             if done:
                 break
 
-        # Calculate score in (0, 1) range - strictly between 0 and 1, not inclusive
+        # Compute score
         score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.001
-        score = min(max(score, 0.001), 0.999)  # clamp to (0, 1) exclusive
+        score = min(max(score, 0.001), 0.999)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
@@ -265,14 +466,28 @@ def run_task(task_name: str, client: OpenAI) -> None:
         except Exception as e:
             print(f"[DEBUG] env.close() error: {e}", flush=True)
 
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(
+            success=success,
+            steps=steps_taken,
+            score=score,
+            rewards=rewards,
+            delivered=total_delivered,
+            dropped=total_dropped,
+            avg_latency=last_avg_latency,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    """Run inference on all task types."""
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Client is optional — if no API key, the fallback greedy agent runs
+    client: Optional[OpenAI] = None
+    if API_KEY:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # Run all 3 tasks to meet hackathon validation requirements
     for task_type in TASK_TYPES:
         run_task(task_type, client)
 
