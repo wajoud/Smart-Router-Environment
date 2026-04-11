@@ -436,7 +436,6 @@ def run_task(task_name: str, client: Optional[OpenAI]) -> None:
                 net_util=new_obs.network_utilization,
                 error=info.get("error"),
             )
-            time.sleep(1)  # Requests are being rate limited
 
             # Build history entry for next prompt
             history.append(
